@@ -412,8 +412,6 @@ extern "C" {
         __arg: ::std::ffi::VaList,
     ) -> libc::c_int;
 
-    fn putchar(__c: libc::c_int) -> libc::c_int;
-
     fn ferror(__stream: *mut FILE) -> libc::c_int;
 
     fn fputs(__s: *const libc::c_char, __stream: *mut FILE) -> libc::c_int;
@@ -1093,41 +1091,38 @@ unsafe fn node_dump_padded(mut node: *mut node, mut padding: u8, mut arrow: bool
     }
     let mut i: u8 = 0 as libc::c_int as u8;
     while (i as libc::c_int) < padding as libc::c_int {
-        putchar(' ' as i32);
+        print!(" ");
         i = i.wrapping_add(1)
     }
     if arrow {
         // Sorry Windows, no fancy UTF-8 for you
-        fputs(
-            b"\xe2\x94\x94\xe2\x94\x80\xe2\x86\x92 \x00" as *const u8 as *const libc::c_char,
-            stdout,
-        );
+        print!("└─→ ");
     }
     match (*node).kind as libc::c_uint {
         0 | 2 | 8 => {
-            fputs((*node).value.to_cstring().as_ptr(), stdout);
+            print!("{}", (*node).value);
         }
         1 => {
-            putchar('/' as i32);
+            print!("/");
         }
         3 => {
-            putchar('-' as i32);
+            print!("-");
         }
         4 => {
-            fputs(b"- (neg)\x00" as *const u8 as *const libc::c_char, stdout);
+            print!("- (neg)");
         }
         5 => {
-            putchar('+' as i32);
+            print!("+");
         }
         6 => {
-            putchar('^' as i32);
+            print!("^");
         }
         7 => {
-            putchar('*' as i32);
+            print!("*");
         }
         _ => {}
     }
-    putchar('\n' as i32);
+    print!("\n");
     node_dump_padded(
         (*node).left,
         (padding as libc::c_int + 2 as libc::c_int) as u8,
