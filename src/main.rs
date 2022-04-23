@@ -9,11 +9,12 @@
 )]
 
 use std::{
+    alloc::{alloc_zeroed, dealloc, Layout},
     error,
     ffi::{CStr, CString},
-    fmt,
+    fmt, mem,
     process::exit,
-    ptr, mem,
+    ptr,
 };
 
 use gpoint::GPoint;
@@ -75,7 +76,7 @@ macro_rules! parse_error {
 }
 
 impl Error {
-    pub fn expect(wanted: &str, got: TokenKind) -> Self {
+    pub fn expect(wanted: &str, got: Token) -> Self {
         Self::ParseError(format!("expecting {}, got '{}'", wanted, got))
     }
 }
@@ -305,7 +306,7 @@ enum OpAssoc {
 type OpPrec = i8;
 
 #[derive(Clone, Debug, PartialEq)]
-enum TokenKind {
+enum Token {
     Div,
     Minus,
     Number(f64),
@@ -318,9 +319,9 @@ enum TokenKind {
     Id(String),
 }
 
-impl TokenKind {
+impl Token {
     const fn arity(&self) -> OpArity {
-        use TokenKind::*;
+        use Token::*;
 
         match self {
             Div | Minus | Plus | Times | Caret => OpArity::Binary,
@@ -329,7 +330,7 @@ impl TokenKind {
     }
 
     const fn assoc(&self) -> OpAssoc {
-        use TokenKind::*;
+        use Token::*;
 
         match self {
             Div | Minus | Plus | Times => OpAssoc::Left,
@@ -339,7 +340,7 @@ impl TokenKind {
     }
 
     const fn prec(&self) -> OpPrec {
-        use TokenKind::*;
+        use Token::*;
 
         match self {
             Div => 2,
@@ -352,9 +353,9 @@ impl TokenKind {
     }
 }
 
-impl fmt::Display for TokenKind {
+impl fmt::Display for Token {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        use TokenKind::*;
+        use Token::*;
 
         match self {
             Div => write!(f, "/"),
@@ -447,22 +448,8 @@ extern "C" {
     fn puts(__s: *const libc::c_char) -> libc::c_int;
 
     fn ungetc(__c: libc::c_int, __stream: *mut FILE) -> libc::c_int;
-
-    fn calloc(_: libc::c_ulong, _: libc::c_ulong) -> *mut libc::c_void;
-
-    fn free(__ptr: *mut libc::c_void);
-
-    fn memset(_: *mut libc::c_void, _: libc::c_int, _: libc::c_ulong) -> *mut libc::c_void;
 }
-type __builtin_va_list = [__va_list_tag; 1];
-#[derive(Copy, Clone)]
-#[repr(C)]
-struct __va_list_tag {
-    pub gp_offset: libc::c_uint,
-    pub fp_offset: libc::c_uint,
-    pub overflow_arg_area: *mut libc::c_void,
-    pub reg_save_area: *mut libc::c_void,
-}
+
 type __off_t = libc::c_long;
 type __off64_t = libc::c_long;
 type C2RustUnnamed = libc::c_uint;
@@ -478,7 +465,7 @@ const _ISdigit: C2RustUnnamed = 2048;
 const _ISalpha: C2RustUnnamed = 1024;
 const _ISlower: C2RustUnnamed = 512;
 const _ISupper: C2RustUnnamed = 256;
-type va_list = __builtin_va_list;
+
 #[derive(Copy, Clone)]
 #[repr(C)]
 struct _IO_FILE {
@@ -526,7 +513,139 @@ type FILE = _IO_FILE;
 #[repr(C)]
 struct lex {
     pub f: *mut FILE,
-    pub next: Option<TokenKind>,
+    pub next: Option<Token>,
+}
+
+impl lex {
+    unsafe fn from_stdio(f: *mut FILE) -> Result<Self, LexError> {
+        let mut ret = Self { f: f, next: None };
+
+        ret.f = f;
+        ret.next = Some(ret.next_tok()?);
+
+        Ok(ret)
+    }
+
+    unsafe fn next_id_tok(&mut self) -> Result<Token, LexError> {
+        let mut id_acc = vec![];
+
+        loop {
+            let mut peek = peekc(self.f);
+            if peek == -1 && ferror(self.f) != 0 {
+                return Err(LexError::IoError);
+            }
+
+            if *(*__ctype_b_loc()).offset(peek as isize) as libc::c_int
+                & _ISalnum as libc::c_int as libc::c_ushort as libc::c_int
+                == 0
+            {
+                break;
+            }
+
+            id_acc.push(nextc(self.f) as u8);
+        }
+
+        let id_str = String::from_utf8(id_acc).map_err(|e| LexError::InvalidUtf8 {
+            cause: e.utf8_error(),
+        })?;
+
+        Ok(Token::Id(id_str))
+    }
+
+    unsafe fn next_num_tok(&mut self) -> Result<Token, LexError> {
+        let mut val = 0u64;
+        let mut dec_div = 1.0f64;
+        let mut dec: bool = false;
+
+        loop {
+            let mut next = peekc(self.f);
+            if next == -1 && ferror(self.f) != 0 {
+                return Err(LexError::IoError);
+            }
+            if next as libc::c_int == '.' as i32 {
+                if dec {
+                    // Two dots in a numeric token
+                    return Err(LexError::UnexpectedChar('.'));
+                } else {
+                    dec = 1 as libc::c_int != 0; // drop the dot
+                    _IO_getc(self.f); // discard the number we've already
+                }
+            } else {
+                if !(*(*__ctype_b_loc()).offset(next as libc::c_int as isize) as libc::c_int
+                    & _ISdigit as libc::c_int as libc::c_ushort as libc::c_int
+                    != 0)
+                {
+                    break;
+                }
+                _IO_getc(self.f);
+                val = (10 as libc::c_int as libc::c_ulong)
+                    .wrapping_mul(val)
+                    .wrapping_add((next as libc::c_int - '0' as i32) as libc::c_ulong);
+                if dec {
+                    dec_div *= 10.0f64;
+                }
+            }
+        }
+
+        Ok(Token::Number(val as f64 / dec_div))
+    }
+
+    unsafe fn next_tok(&mut self) -> Result<Token, LexError> {
+        let first = nextc(self.f) as libc::c_char;
+        if first == -1 {
+            if ferror(self.f) != 0 {
+                return Err(LexError::IoError);
+            }
+
+            return Err(LexError::Eof);
+        }
+
+        Ok(match first as u8 as char {
+            '/' => Token::Div,
+            '-' => Token::Minus,
+            '+' => Token::Plus,
+            '*' => Token::Times,
+            '\n' => Token::Newline,
+            '(' => Token::OPar,
+            ')' => Token::CPar,
+            '^' => Token::Caret,
+            ch => {
+                ungetc(first as libc::c_int, self.f);
+
+                if ch.is_ascii_digit() || ch == '.' {
+                    self.next_num_tok()?
+                } else if ch.is_ascii_alphabetic() {
+                    self.next_id_tok()?
+                } else {
+                    return Err(LexError::UnexpectedChar(ch));
+                }
+            }
+        })
+    }
+
+    pub unsafe fn next(&mut self) -> Result<Token, LexError> {
+        if self.next.is_none() {
+            return Err(LexError::Eof);
+        }
+
+        let some_succ = match self.next_tok() {
+            Ok(tok) => Some(tok),
+            Err(LexError::Eof) => None,
+            Err(e) => return Err(e),
+        };
+
+        mem::replace(&mut self.next, some_succ).ok_or(LexError::Eof)
+    }
+}
+
+impl Drop for lex {
+    fn drop(&mut self) {
+        unsafe {
+            if self.f != stdin {
+                fclose(self.f);
+            }
+        }
+    }
 }
 
 type node_type = libc::c_uint;
@@ -571,168 +690,32 @@ unsafe fn peekc(mut f: *mut FILE) -> libc::c_int {
     return ret;
 }
 
-unsafe fn lex_init(f: *mut FILE) -> Result<lex, LexError> {
-    let mut ret = lex {
-        f: f,
-        next: None,
-    };
-
-    ret.f = f;
-    ret.next = Some(lex_next_tok(&mut ret)?);
-
-    Ok(ret)
-}
-
-unsafe fn lex_deinit(lex: *mut lex) {
-    (*lex).next = None;
-    if (*lex).f != stdin {
-        fclose((*lex).f);
-    };
-}
-
-unsafe fn lex_next_id_tok(mut lex: *mut lex) -> Result<TokenKind, LexError> {
-    let mut id_acc = vec![];
-
-    loop {
-        let mut peek: libc::c_char = peekc((*lex).f) as libc::c_char;
-        if peek as libc::c_int == -(1 as libc::c_int) && ferror((*lex).f) != 0 {
-            return Err(LexError::IoError);
-        }
-        if *(*__ctype_b_loc()).offset(peek as libc::c_int as isize) as libc::c_int
-            & _ISalnum as libc::c_int as libc::c_ushort as libc::c_int
-            == 0
-        {
-            break;
-        }
-
-        id_acc.push(nextc((*lex).f) as u8);
-    }
-
-    let id_str = String::from_utf8(id_acc).map_err(|e| LexError::InvalidUtf8 {
-        cause: e.utf8_error(),
-    })?;
-
-    Ok(TokenKind::Id(id_str))
-}
-
-unsafe fn lex_next_num_tok(mut lex: *mut lex) -> Result<TokenKind, LexError> {
-    let mut val = 0u64;
-    let mut dec_div = 1.0f64;
-    let mut dec: bool = false;
-
-    loop {
-        let mut next: libc::c_char = peekc((*lex).f) as libc::c_char;
-        if next as libc::c_int == -(1 as libc::c_int) && ferror((*lex).f) != 0 {
-            return Err(LexError::IoError);
-        }
-        if next as libc::c_int == '.' as i32 {
-            if dec {
-                // Two dots in a numeric token
-                return Err(LexError::UnexpectedChar('.'));
-            } else {
-                dec = 1 as libc::c_int != 0; // drop the dot
-                _IO_getc((*lex).f); // discard the number we've already
-            }
-        } else {
-            if !(*(*__ctype_b_loc()).offset(next as libc::c_int as isize) as libc::c_int
-                & _ISdigit as libc::c_int as libc::c_ushort as libc::c_int
-                != 0)
-            {
-                break;
-            }
-            _IO_getc((*lex).f);
-            val = (10 as libc::c_int as libc::c_ulong)
-                .wrapping_mul(val)
-                .wrapping_add((next as libc::c_int - '0' as i32) as libc::c_ulong);
-            if dec {
-                dec_div *= 10.0f64;
-            }
-        }
-    }
-
-    Ok(TokenKind::Number(val as f64 / dec_div))
-}
-
-unsafe fn lex_next_tok(mut lex: *mut lex) -> Result<TokenKind, LexError> {
-    let first = nextc((*lex).f) as libc::c_char;
-    if first == -1 {
-        if ferror((*lex).f) != 0 {
-            return Err(LexError::IoError);
-        }
-
-        return Err(LexError::Eof);
-    }
-
-    Ok(match first as u8 as char {
-        '/' => TokenKind::Div,
-        '-' => TokenKind::Minus,
-        '+' => TokenKind::Plus,
-        '*' => TokenKind::Times,
-        '\n' => TokenKind::Newline,
-        '(' => TokenKind::OPar,
-        ')' => TokenKind::CPar,
-        '^' => TokenKind::Caret,
-        ch => {
-            ungetc(first as libc::c_int, (*lex).f);
-
-            if ch.is_ascii_digit() || ch == '.' {
-                lex_next_num_tok(lex)?
-            } else if ch.is_ascii_alphabetic() {
-                lex_next_id_tok(lex)?
-            } else {
-                return Err(LexError::UnexpectedChar(ch));
-            }
-        }
-    })
-}
-
-unsafe fn lex_next(mut lex: *mut lex) -> Result<TokenKind, LexError> {
-    if (*lex).next.is_none() {
-        return Err(LexError::Eof);
-    }
-
-    mem::replace(
-        &mut (*lex).next, 
-        match lex_next_tok(lex) {
-            Ok(tok) => Some(tok),
-            Err(LexError::Eof) => None,
-            Err(e) => return Err(e),
-        },
-    ).ok_or(LexError::Eof)
-}
-
 unsafe fn node_free(mut n: *mut node) {
     if !n.is_null() {
         node_free((*n).left);
         node_free((*n).right);
-        free(n as *mut libc::c_void);
+        dealloc(n as *mut u8, Layout::new::<node>());
     };
 }
 
 unsafe fn node_new(mut kind: node_type) -> *mut node {
-    let mut ret: *mut node = calloc(
-        1 as libc::c_int as libc::c_ulong,
-        ::std::mem::size_of::<node>() as libc::c_ulong,
-    ) as *mut node;
+    let mut ret: *mut node = alloc_zeroed(Layout::new::<node>()) as *mut node;
     (*ret).kind = kind;
     return ret;
 }
 
-unsafe fn node_bin_from_token(kind: TokenKind, left: *mut node, right: *mut node) -> *mut node {
-    let ret: *mut node = calloc(
-        1 as libc::c_int as libc::c_ulong,
-        ::std::mem::size_of::<node>() as libc::c_ulong,
-    ) as *mut node;
+unsafe fn node_bin_from_token(token: Token, left: *mut node, right: *mut node) -> *mut node {
+    let mut ret: *mut node = alloc_zeroed(Layout::new::<node>()) as *mut node;
 
-    use TokenKind::*;
-    match kind {
+    use Token::*;
+    match token {
         Caret => (*ret).kind = NODE_POW,
         Div => (*ret).kind = NODE_DIV,
         Minus => (*ret).kind = NODE_MINUS,
         Plus => (*ret).kind = NODE_PLUS,
         Times => (*ret).kind = NODE_TIMES,
         _ => {
-            free(ret as *mut libc::c_void);
+            dealloc(ret as *mut u8, Layout::new::<node>());
             return ptr::null_mut();
         }
     }
@@ -743,10 +726,10 @@ unsafe fn node_bin_from_token(kind: TokenKind, left: *mut node, right: *mut node
     ret
 }
 
-unsafe fn parse_parens(lex: *mut lex) -> Result<*mut node, Error> {
+unsafe fn parse_parens(lex: &mut lex) -> Result<*mut node, Error> {
     let par_expr = parse_expr(lex)?;
 
-    let cpar_tok = match lex_next(lex) {
+    let cpar_tok = match lex.next() {
         Ok(tok) => tok,
         Err(lerr) => {
             node_free(par_expr);
@@ -754,7 +737,7 @@ unsafe fn parse_parens(lex: *mut lex) -> Result<*mut node, Error> {
         }
     };
 
-    if cpar_tok == TokenKind::CPar {
+    if cpar_tok == Token::CPar {
         Ok(par_expr)
     } else {
         node_free(par_expr);
@@ -763,7 +746,7 @@ unsafe fn parse_parens(lex: *mut lex) -> Result<*mut node, Error> {
     }
 }
 
-unsafe fn parse_func(mut lex: *mut lex, mut id: *const libc::c_char) -> Result<*mut node, Error> {
+unsafe fn parse_func(lex: &mut lex, mut id: *const libc::c_char) -> Result<*mut node, Error> {
     let c_id = CStr::from_ptr(id);
 
     let f_id = Func::try_from(c_id)?;
@@ -780,8 +763,8 @@ unsafe fn parse_func(mut lex: *mut lex, mut id: *const libc::c_char) -> Result<*
     return Ok(ret);
 }
 
-unsafe fn parse_primary(mut lex: *mut lex) -> Result<*mut node, Error> {
-    let ntok = lex_next(lex).map_err(|lerr| {
+unsafe fn parse_primary(lex: &mut lex) -> Result<*mut node, Error> {
+    let ntok = lex.next().map_err(|lerr| {
         if lerr == LexError::Eof {
             parse_error!("unexpected EOF")
         } else {
@@ -790,10 +773,10 @@ unsafe fn parse_primary(mut lex: *mut lex) -> Result<*mut node, Error> {
     })?;
 
     match ntok {
-        TokenKind::Id(id) => {
+        Token::Id(id) => {
             let c_id = CString::new(id).unwrap();
 
-            if (*lex).next == Some(TokenKind::OPar) {
+            if lex.next == Some(Token::OPar) {
                 return parse_func(lex, c_id.as_ptr());
             }
 
@@ -812,27 +795,27 @@ unsafe fn parse_primary(mut lex: *mut lex) -> Result<*mut node, Error> {
 
             Ok(num)
         }
-        TokenKind::Number(n) => {
+        Token::Number(n) => {
             let num_0 = node_new(NODE_VAL);
 
             (*num_0).value = Value::Number(n);
 
             Ok(num_0)
         }
-        TokenKind::OPar => parse_parens(lex),
+        Token::OPar => parse_parens(lex),
         _ => Err(Error::expect("a number or parentheses", ntok)),
     }
 }
 
 unsafe fn parse_binary(
-    lex: *mut lex,
+    lex: &mut lex,
     mut lhs: *mut node,
     mut min_prec: OpPrec,
 ) -> Result<*mut node, Error> {
     let mut cur_op_prec: OpPrec = 0;
 
     loop {
-        let next = match &(*lex).next {
+        let next = match &lex.next {
             Some(tok) => tok,
             None => break,
         };
@@ -840,11 +823,11 @@ unsafe fn parse_binary(
         cur_op_prec = next.prec();
 
         if cur_op_prec >= min_prec && next.arity() == OpArity::Binary {
-            let mut op_tok = lex_next(lex)?;
+            let mut op_tok = lex.next()?;
 
             let mut rhs = parse_unary(lex)?;
 
-            if let Some(next) = &(*lex).next {
+            if let Some(next) = &lex.next {
                 let next_op_prec = next.prec();
                 let next_assoc_right = next.assoc() == OpAssoc::Right;
 
@@ -855,21 +838,21 @@ unsafe fn parse_binary(
 
             lhs = node_bin_from_token(op_tok, lhs, rhs)
         } else {
-            break
+            break;
         }
     }
 
     Ok(lhs)
 }
 
-unsafe fn parse_unary(lex: *mut lex) -> Result<*mut node, Error> {
-    match &(*lex).next {
-        Some(next) if next == &TokenKind::Minus || next == &TokenKind::Plus => {
-            let op_top = lex_next(lex)?;
+unsafe fn parse_unary(lex: &mut lex) -> Result<*mut node, Error> {
+    match &lex.next {
+        Some(next) if next == &Token::Minus || next == &Token::Plus => {
+            let op_top = lex.next()?;
 
             let right_expr = parse_unary(lex)?;
 
-            if op_top == TokenKind::Minus {
+            if op_top == Token::Minus {
                 if (*right_expr).kind as libc::c_uint != NODE_VAL as libc::c_int as libc::c_uint {
                     let mut neg_expr: *mut node = node_new(NODE_NEG);
                     (*neg_expr).left = right_expr;
@@ -888,8 +871,8 @@ unsafe fn parse_unary(lex: *mut lex) -> Result<*mut node, Error> {
     }
 }
 
-unsafe fn parse_expr(lex: *mut lex) -> Result<*mut node, Error> {
-    if let Some(TokenKind::Newline) | None = (*lex).next {
+unsafe fn parse_expr(lex: &mut lex) -> Result<*mut node, Error> {
+    if let Some(Token::Newline) | None = lex.next {
         return Ok(ptr::null_mut());
     }
 
@@ -1009,7 +992,7 @@ fn main() {
     }
 
     unsafe {
-        let mut lex = match lex_init(stdin) {
+        let mut lex = match lex::from_stdio(stdin) {
             Ok(lex) => lex,
             Err(lerr) => {
                 eprintln!("error: {}", lerr);
@@ -1035,15 +1018,15 @@ fn main() {
                     }
                     node_free(tree);
 
-                    match lex_next(&mut lex) {
+                    match lex.next() {
                         Ok(ntok) => {
-                            if ntok != TokenKind::Newline {
+                            if ntok != Token::Newline {
                                 eprintln!(
                                     "error: stray '{}' left in stream after expression",
                                     ntok,
                                 );
 
-                                status = 1 as libc::c_int;
+                                status = 1i32;
                                 break;
                             } else {
                                 status = 0 as libc::c_int
@@ -1070,7 +1053,6 @@ fn main() {
                 }
             }
         }
-        lex_deinit(&mut lex);
     }
 
     exit(status);
