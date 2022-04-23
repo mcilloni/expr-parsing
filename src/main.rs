@@ -1,5 +1,4 @@
 #![allow(
-    dead_code,
     mutable_transmutes,
     non_camel_case_types,
     non_snake_case,
@@ -8,7 +7,7 @@
 
 use std::{
     error,
-    ffi::{CStr, CString},
+    ffi::CStr,
     fmt, io, mem,
     process::exit,
 };
@@ -18,19 +17,11 @@ use gpoint::GPoint;
 #[derive(Eq, Debug, PartialEq)]
 enum LexError {
     Eof,
-    IdTooLong,
 
     InvalidUtf8 { cause: std::str::Utf8Error },
 
     IoError,
-    Dangling,
     UnexpectedChar(char),
-}
-
-impl LexError {
-    fn to_cstring(&self) -> CString {
-        CString::new(self.to_string()).unwrap()
-    }
 }
 
 impl error::Error for LexError {
@@ -46,10 +37,8 @@ impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             LexError::Eof => write!(f, "reached end of file"),
-            LexError::IdTooLong => write!(f, "identifier too long"),
             LexError::InvalidUtf8 { cause } => write!(f, "invalid UTF-8: {}", cause),
             LexError::IoError => write!(f, "I/O error"),
-            LexError::Dangling => write!(f, "uninitialized"),
             LexError::UnexpectedChar(c) => write!(f, "unexpected character: {}", c),
         }
     }
@@ -62,7 +51,6 @@ enum Error {
     ParseError(String),
     UnknownConstant { name: String },
     UnknownFunction { name: String },
-    ValueError(String),
 }
 
 macro_rules! parse_error {
@@ -104,7 +92,6 @@ impl fmt::Display for Error {
             UnknownFunction { name } => {
                 write!(f, "unknown function '{}'", name)
             }
-            ValueError(s) => write!(f, "value error: {}", s),
         }
     }
 }
@@ -198,10 +185,6 @@ impl fmt::Display for Constant {
 }
 
 impl Constant {
-    pub fn cname(&self) -> CString {
-        CString::new(self.name()).expect("conversion to CString failed")
-    }
-
     pub fn name(&self) -> &'static str {
         use Constant::*;
 
@@ -288,10 +271,6 @@ impl Func {
             Func::Tan => "tan",
         }
     }
-}
-
-enum LexState {
-    Ok,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -424,7 +403,6 @@ impl fmt::Display for Node {
 enum OpArity {
     Binary,
     None,
-    Unary,
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -551,38 +529,15 @@ extern "C" {
 
     static mut stdin: *mut _IO_FILE;
 
-    static mut stdout: *mut _IO_FILE;
-
     fn fclose(__stream: *mut FILE) -> libc::c_int;
 
-    fn fprintf(_: *mut FILE, _: *const libc::c_char, _: ...) -> libc::c_int;
-
-    fn printf(_: *const libc::c_char, _: ...) -> libc::c_int;
-
     fn ferror(__stream: *mut FILE) -> libc::c_int;
-
-    fn fputs(__s: *const libc::c_char, __stream: *mut FILE) -> libc::c_int;
-
-    fn puts(__s: *const libc::c_char) -> libc::c_int;
 
     fn ungetc(__c: libc::c_int, __stream: *mut FILE) -> libc::c_int;
 }
 
 type __off_t = libc::c_long;
 type __off64_t = libc::c_long;
-type C2RustUnnamed = libc::c_uint;
-const _ISalnum: C2RustUnnamed = 8;
-const _ISpunct: C2RustUnnamed = 4;
-const _IScntrl: C2RustUnnamed = 2;
-const _ISblank: C2RustUnnamed = 1;
-const _ISgraph: C2RustUnnamed = 32768;
-const _ISprint: C2RustUnnamed = 16384;
-const _ISspace: C2RustUnnamed = 8192;
-const _ISxdigit: C2RustUnnamed = 4096;
-const _ISdigit: C2RustUnnamed = 2048;
-const _ISalpha: C2RustUnnamed = 1024;
-const _ISlower: C2RustUnnamed = 512;
-const _ISupper: C2RustUnnamed = 256;
 
 #[derive(Copy, Clone)]
 #[repr(C)]
@@ -655,10 +610,7 @@ impl lex {
                 return Err(LexError::IoError);
             }
 
-            if *(*__ctype_b_loc()).offset(peek as isize) as libc::c_int
-                & _ISalnum as libc::c_int as libc::c_ushort as libc::c_int
-                == 0
-            {
+            if !char::from_u32_unchecked(peek as u32).is_ascii_alphanumeric() {
                 break;
             }
 
@@ -688,21 +640,20 @@ impl lex {
                     return Err(LexError::UnexpectedChar('.'));
                 } else {
                     dec = 1 as libc::c_int != 0; // drop the dot
-                    _IO_getc(self.f); // discard the number we've already
+                    _IO_getc(self.f); 
                 }
             } else {
-                if !(*(*__ctype_b_loc()).offset(next as libc::c_int as isize) as libc::c_int
-                    & _ISdigit as libc::c_int as libc::c_ushort as libc::c_int
-                    != 0)
-                {
-                    break;
-                }
-                _IO_getc(self.f);
-                val = (10 as libc::c_int as libc::c_ulong)
+                if char::from_u32_unchecked(next as u32).is_ascii_digit() {
+                    _IO_getc(self.f); // discard the number we've already
+                    
+                    val = (10 as libc::c_int as libc::c_ulong)
                     .wrapping_mul(val)
                     .wrapping_add((next as libc::c_int - '0' as i32) as libc::c_ulong);
-                if dec {
-                    dec_div *= 10.0f64;
+                    if dec {
+                        dec_div *= 10.0f64;
+                    }
+                } else {
+                    break;
                 }
             }
         }
@@ -777,11 +728,14 @@ impl Drop for lex {
 unsafe fn nextc(f: *mut FILE) -> libc::c_int {
     loop {
         let ch = _IO_getc(f) as libc::c_char;
-        if !(*(*__ctype_b_loc()).offset(ch as libc::c_int as isize) as libc::c_int
-            & _ISblank as libc::c_int as libc::c_ushort as libc::c_int
-            != 0)
-        {
+        
+        if ch < 0 {
             return ch as libc::c_int;
+        }
+
+        match ch as u8 as char {
+            '\t' | '\r' | ' ' => {},
+            ch => return ch as libc::c_int, 
         }
     }
 }
