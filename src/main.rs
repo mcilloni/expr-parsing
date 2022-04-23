@@ -12,7 +12,7 @@ use std::{
     alloc::{alloc_zeroed, dealloc, Layout},
     error,
     ffi::{CStr, CString},
-    fmt, mem,
+    fmt, io, mem,
     process::exit,
     ptr,
 };
@@ -109,6 +109,29 @@ impl fmt::Display for Error {
                 write!(f, "unknown function '{}'", name)
             }
             ValueError(s) => write!(f, "value error: {}", s),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BinaryOp {
+    Div,
+    Pow,
+    Plus,
+    Minus,
+    Times,
+}
+
+impl fmt::Display for BinaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use BinaryOp::*;
+
+        match self {
+            Div => write!(f, "/"),
+            Pow => write!(f, "^"),
+            Plus => write!(f, "+"),
+            Minus => write!(f, "-"),
+            Times => write!(f, "*"),
         }
     }
 }
@@ -242,10 +265,6 @@ impl Func {
         }
     }
 
-    fn cname(self) -> CString {
-        CString::new(self.name()).expect("conversion to CString failed")
-    }
-
     pub fn name(self) -> &'static str {
         match self {
             Func::Atan => "atan",
@@ -276,27 +295,89 @@ enum Node {
     },
     Unary {
         op: UnaryOp,
-        rhs: Box<Node>,
+        arg: Box<Node>,
     },
     Value(Value),
 }
 
-enum BinaryOp {
-    Div,
-    Pow,
-    Plus,
-    Minus,
-    Times,
+impl Node {
+    pub fn dump(&self) {
+        self.dump_to(&mut io::stdout()).unwrap();
+    }
+
+    pub fn dump_to(&self, w: &mut impl io::Write) -> Result<(), io::Error> {
+        self.dump_tree_impl_to(w, 0, false)
+    }
+
+    fn dump_tree_impl_to(
+        &self,
+        w: &mut impl io::Write,
+        padding: u8,
+        arrow: bool,
+    ) -> Result<(), io::Error> {
+        for _ in 0..padding {
+            write!(w, " ")?;
+        }
+
+        if arrow {
+            write!(w, "└─→ ")?;
+        }
+
+        use Node::*;
+
+        match self {
+            Binary { op, lhs, rhs } => {
+                write!(w, "{}", op)?;
+
+                lhs.dump_tree_impl_to(w, padding + 2, true)?;
+                rhs.dump_tree_impl_to(w, padding + 2, true)?;
+            }
+            Call { .. } => {
+                write!(w, "{}", self)?;
+            }
+            Unary { op, arg } => {
+                write!(w, "{}", op)?;
+
+                arg.dump_tree_impl_to(w, padding + 2, true)?;
+            }
+            Value(val) => {
+                write!(w, "{}", val)?;
+            }
+        };
+
+        Ok(())
+    }
 }
 
-#[derive(Eq, PartialEq)]
+impl fmt::Display for Node {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use Node::*;
+
+        match self {
+            Binary { op, lhs, rhs } => write!(f, "{} {} {}", lhs, op, rhs),
+            Call { func, args } => write!(
+                f,
+                "{}({})",
+                func,
+                args.iter()
+                    .map(|n| format!("{}", n))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Unary { op, arg } => write!(f, "{}{}", op, arg),
+            Value(v) => write!(f, "{}", v),
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum OpArity {
     Binary,
     None,
     Unary,
 }
 
-#[derive(Eq, PartialEq)]
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum OpAssoc {
     Left,
     None,
@@ -307,16 +388,16 @@ type OpPrec = i8;
 
 #[derive(Clone, Debug, PartialEq)]
 enum Token {
+    Caret,
+    CPar,
     Div,
+    Id(String),
     Minus,
+    Newline,
     Number(f64),
+    OPar,
     Plus,
     Times,
-    Newline,
-    OPar,
-    CPar,
-    Caret,
-    Id(String),
 }
 
 impl Token {
@@ -343,11 +424,11 @@ impl Token {
         use Token::*;
 
         match self {
+            Caret => 3,
             Div => 2,
             Minus => 1,
             Plus => 1,
             Times => 2,
-            Caret => 3,
             _ => -1,
         }
     }
@@ -358,22 +439,33 @@ impl fmt::Display for Token {
         use Token::*;
 
         match self {
+            Caret => write!(f, "^"),
+            CPar => write!(f, ")"),
             Div => write!(f, "/"),
+            Id(str) => write!(f, "{}", str),
             Minus => write!(f, "-"),
+            Newline => write!(f, "\\n"),
             Number(n) => write!(f, "{}", GPoint(*n)),
             Plus => write!(f, "+"),
-            Times => write!(f, "*"),
-            Newline => write!(f, "\\n"),
             OPar => write!(f, "("),
-            CPar => write!(f, ")"),
-            Caret => write!(f, "^"),
-            Id(str) => write!(f, "{}", str),
+            Times => write!(f, "*"),
         }
     }
 }
 
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
 enum UnaryOp {
     Neg,
+}
+
+impl fmt::Display for UnaryOp {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        use UnaryOp::*;
+
+        match self {
+            Neg => write!(f, "-"),
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -419,10 +511,6 @@ impl Value {
             Number(n) => n,
             Func(f) => f.eval(some_x.unwrap()),
         }
-    }
-
-    pub fn to_cstring(&self) -> CString {
-        CString::new(self.to_string()).expect("conversion to CString failed")
     }
 }
 
