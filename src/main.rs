@@ -4,17 +4,13 @@
     non_camel_case_types,
     non_snake_case,
     non_upper_case_globals,
-    unused_assignments,
-    unused_mut
 )]
 
 use std::{
-    alloc::{alloc_zeroed, dealloc, Layout},
     error,
     ffi::{CStr, CString},
     fmt, io, mem,
     process::exit,
-    ptr,
 };
 
 use gpoint::GPoint;
@@ -116,10 +112,25 @@ impl fmt::Display for Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BinaryOp {
     Div,
-    Pow,
     Plus,
+    Pow,
     Minus,
     Times,
+}
+
+impl TryFrom<Token> for BinaryOp {
+    type Error = Error;
+
+    fn try_from(token: Token) -> Result<Self, Self::Error> {
+        match token {
+            Token::Caret => Ok(BinaryOp::Pow),
+            Token::Div => Ok(BinaryOp::Div),
+            Token::Plus => Ok(BinaryOp::Plus),
+            Token::Minus => Ok(BinaryOp::Minus),
+            Token::Times => Ok(BinaryOp::Times),
+            _ => Err(Error::expect("binary operator", token)),
+        }
+    }
 }
 
 impl fmt::Display for BinaryOp {
@@ -128,15 +139,15 @@ impl fmt::Display for BinaryOp {
 
         match self {
             Div => write!(f, "/"),
-            Pow => write!(f, "^"),
             Plus => write!(f, "+"),
+            Pow => write!(f, "^"),
             Minus => write!(f, "-"),
             Times => write!(f, "*"),
         }
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Constant {
     E,
     Pi,
@@ -201,7 +212,7 @@ impl Constant {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Func {
     Atan,
     Cos,
@@ -283,6 +294,7 @@ enum LexState {
     Ok,
 }
 
+#[derive(Clone, Debug, PartialEq)]
 enum Node {
     Binary {
         op: BinaryOp,
@@ -295,7 +307,7 @@ enum Node {
     },
     Unary {
         op: UnaryOp,
-        arg: Box<Node>,
+        expr: Box<Node>,
     },
     Value(Value),
 }
@@ -327,25 +339,63 @@ impl Node {
 
         match self {
             Binary { op, lhs, rhs } => {
-                write!(w, "{}", op)?;
+                writeln!(w, "{}", op)?;
 
                 lhs.dump_tree_impl_to(w, padding + 2, true)?;
                 rhs.dump_tree_impl_to(w, padding + 2, true)?;
             }
-            Call { .. } => {
-                write!(w, "{}", self)?;
+            Call { func, args } => {
+                writeln!(w, "{}", func)?;
+
+                args.first().unwrap().dump_tree_impl_to(w, padding + 2, true)?;
             }
-            Unary { op, arg } => {
-                write!(w, "{}", op)?;
+            Unary { op, expr: arg } => {
+                writeln!(w, "{}", op)?;
 
                 arg.dump_tree_impl_to(w, padding + 2, true)?;
             }
             Value(val) => {
-                write!(w, "{}", val)?;
+                writeln!(w, "{}", val)?;
             }
         };
 
         Ok(())
+    }
+
+    fn eval(&self) -> f64 {
+        use Node::*;
+    
+        match self {
+            Binary { op, lhs, rhs } => {
+                let left = lhs.eval();
+                let right = rhs.eval();
+    
+                use BinaryOp::*;
+    
+                match op {
+                    Div => left / right,
+                    Minus => left - right,
+                    Pow => left.powf(right),
+                    Plus => left + right,
+                    Times => left * right,
+                }
+            },
+            Call { func, args } => {
+                let arg = args.first().expect("no args").eval();
+    
+                func.eval(arg)
+            }
+            Value(val) => val.into(),
+            Unary { op, expr } => {
+                let right = expr.eval();
+    
+                use UnaryOp::*;
+    
+                match op {
+                    Neg => -right,
+                }
+            }
+        }
     }
 }
 
@@ -364,7 +414,7 @@ impl fmt::Display for Node {
                     .collect::<Vec<_>>()
                     .join(", ")
             ),
-            Unary { op, arg } => write!(f, "{}{}", op, arg),
+            Unary { op, expr: arg } => write!(f, "{}{}", op, arg),
             Value(v) => write!(f, "{}", v),
         }
     }
@@ -468,24 +518,17 @@ impl fmt::Display for UnaryOp {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 enum Value {
     Constant(Constant),
     Number(f64),
-    Func(Func),
 }
 
-impl TryFrom<Value> for f64 {
-    type Error = Error;
-
-    fn try_from(v: Value) -> Result<Self, Self::Error> {
+impl From<&Value> for f64 {
+    fn from(v: &Value) -> Self {
         match v {
-            Value::Constant(c) => Ok(c.into()),
-            Value::Number(n) => Ok(n),
-            Value::Func(f) => Err(Error::ValueError(format!(
-                "function '{}' cannot be converted to a number",
-                f.name()
-            ))),
+            Value::Constant(c) => Self::from(*c),
+            Value::Number(n) => *n,
         }
     }
 }
@@ -497,19 +540,6 @@ impl fmt::Display for Value {
         match *self {
             Constant(c) => write!(f, "{}", c),
             Number(n) => write!(f, "{}", GPoint(n)),
-            Func(func) => write!(f, "{}", func),
-        }
-    }
-}
-
-impl Value {
-    pub fn eval(self, some_x: Option<f64>) -> f64 {
-        use Value::*;
-
-        match self {
-            Constant(c) => c.into(),
-            Number(n) => n,
-            Func(f) => f.eval(some_x.unwrap()),
         }
     }
 }
@@ -605,11 +635,13 @@ struct lex {
 }
 
 impl lex {
-    unsafe fn from_stdio(f: *mut FILE) -> Result<Self, LexError> {
+    fn from_stdio(f: *mut FILE) -> Result<Self, LexError> {
         let mut ret = Self { f: f, next: None };
 
         ret.f = f;
-        ret.next = Some(ret.next_tok()?);
+        ret.next = unsafe {
+            Some(ret.next_tok()?)
+        };
 
         Ok(ret)
     }
@@ -618,7 +650,7 @@ impl lex {
         let mut id_acc = vec![];
 
         loop {
-            let mut peek = peekc(self.f);
+            let peek = peekc(self.f);
             if peek == -1 && ferror(self.f) != 0 {
                 return Err(LexError::IoError);
             }
@@ -646,7 +678,7 @@ impl lex {
         let mut dec: bool = false;
 
         loop {
-            let mut next = peekc(self.f);
+            let next = peekc(self.f);
             if next == -1 && ferror(self.f) != 0 {
                 return Err(LexError::IoError);
             }
@@ -711,18 +743,24 @@ impl lex {
         })
     }
 
-    pub unsafe fn next(&mut self) -> Result<Token, LexError> {
+    pub fn next(&mut self) -> Result<Token, LexError> {
         if self.next.is_none() {
             return Err(LexError::Eof);
         }
 
-        let some_succ = match self.next_tok() {
-            Ok(tok) => Some(tok),
-            Err(LexError::Eof) => None,
-            Err(e) => return Err(e),
-        };
+        unsafe {
+            let some_succ = match self.next_tok() {
+                Ok(tok) => Some(tok),
+                Err(LexError::Eof) => None,
+                Err(e) => return Err(e),
+            };
 
-        mem::replace(&mut self.next, some_succ).ok_or(LexError::Eof)
+            mem::replace(&mut self.next, some_succ).ok_or(LexError::Eof)
+        }
+    }
+
+    pub fn try_discard(&mut self) -> bool {
+        self.next().is_ok()
     }
 }
 
@@ -736,122 +774,55 @@ impl Drop for lex {
     }
 }
 
-type node_type = libc::c_uint;
-const NODE_VAL: node_type = 8;
-const NODE_TIMES: node_type = 7;
-const NODE_POW: node_type = 6;
-const NODE_PLUS: node_type = 5;
-const NODE_NEG: node_type = 4;
-const NODE_MINUS: node_type = 3;
-const NODE_FUNC: node_type = 2;
-const NODE_DIV: node_type = 1;
-const NODE_CONST: node_type = 0;
-
-#[derive(Copy, Clone)]
-#[repr(C)]
-struct node {
-    pub kind: node_type,
-    pub value: Value,
-    pub left: *mut node,
-    pub right: *mut node,
-}
-
-unsafe fn nextc(mut f: *mut FILE) -> libc::c_int {
-    let mut ch: libc::c_char = 0;
+unsafe fn nextc(f: *mut FILE) -> libc::c_int {
     loop {
-        ch = _IO_getc(f) as libc::c_char;
+        let ch = _IO_getc(f) as libc::c_char;
         if !(*(*__ctype_b_loc()).offset(ch as libc::c_int as isize) as libc::c_int
             & _ISblank as libc::c_int as libc::c_ushort as libc::c_int
             != 0)
         {
-            break;
+            return ch as libc::c_int;
         }
     }
-    return ch as libc::c_int;
 }
 
-unsafe fn peekc(mut f: *mut FILE) -> libc::c_int {
-    let mut ret: libc::c_int = _IO_getc(f);
+unsafe fn peekc(f: *mut FILE) -> libc::c_int {
+    let ret = _IO_getc(f);
+
     if ret > 0 as libc::c_int {
         ungetc(ret, f);
     }
+    
     return ret;
 }
 
-unsafe fn node_free(mut n: *mut node) {
-    if !n.is_null() {
-        node_free((*n).left);
-        node_free((*n).right);
-        dealloc(n as *mut u8, Layout::new::<node>());
-    };
-}
-
-unsafe fn node_new(mut kind: node_type) -> *mut node {
-    let mut ret: *mut node = alloc_zeroed(Layout::new::<node>()) as *mut node;
-    (*ret).kind = kind;
-    return ret;
-}
-
-unsafe fn node_bin_from_token(token: Token, left: *mut node, right: *mut node) -> *mut node {
-    let mut ret: *mut node = alloc_zeroed(Layout::new::<node>()) as *mut node;
-
-    use Token::*;
-    match token {
-        Caret => (*ret).kind = NODE_POW,
-        Div => (*ret).kind = NODE_DIV,
-        Minus => (*ret).kind = NODE_MINUS,
-        Plus => (*ret).kind = NODE_PLUS,
-        Times => (*ret).kind = NODE_TIMES,
-        _ => {
-            dealloc(ret as *mut u8, Layout::new::<node>());
-            return ptr::null_mut();
-        }
-    }
-
-    (*ret).left = left;
-    (*ret).right = right;
-
-    ret
-}
-
-unsafe fn parse_parens(lex: &mut lex) -> Result<*mut node, Error> {
+fn parse_parens(lex: &mut lex) -> Result<Node, Error> {
     let par_expr = parse_expr(lex)?;
 
-    let cpar_tok = match lex.next() {
-        Ok(tok) => tok,
-        Err(lerr) => {
-            node_free(par_expr);
-            return Err(lerr.into());
-        }
-    };
+    let cpar_tok = lex.next()?;
 
     if cpar_tok == Token::CPar {
         Ok(par_expr)
     } else {
-        node_free(par_expr);
-
         Err(Error::expect(")", cpar_tok))
     }
 }
 
-unsafe fn parse_func(lex: &mut lex, mut id: *const libc::c_char) -> Result<*mut node, Error> {
-    let c_id = CStr::from_ptr(id);
-
-    let f_id = Func::try_from(c_id)?;
+fn parse_func(lex: &mut lex, id: &str) -> Result<Node, Error> {
+    let f_id = Func::try_from(id)?;
 
     // We know for sure lex->next is a parenthesis, therefore
     // parse_primary will slurp it, parse everything inside and slurp the
     // final ')'
-    let mut call = parse_primary(lex)?;
-    let mut ret: *mut node = node_new(NODE_FUNC);
+    let call = parse_primary(lex)?;
 
-    (*ret).value = Value::Func(f_id);
-    (*ret).left = call;
-
-    return Ok(ret);
+    Ok(Node::Call {
+        func: f_id,
+        args: vec![call],
+    })
 }
 
-unsafe fn parse_primary(lex: &mut lex) -> Result<*mut node, Error> {
+fn parse_primary(lex: &mut lex) -> Result<Node, Error> {
     let ntok = lex.next().map_err(|lerr| {
         if lerr == LexError::Eof {
             parse_error!("unexpected EOF")
@@ -861,46 +832,41 @@ unsafe fn parse_primary(lex: &mut lex) -> Result<*mut node, Error> {
     })?;
 
     match ntok {
-        Token::Id(id) => {
-            let c_id = CString::new(id).unwrap();
-
+        Token::Id(ref id) => {
             if lex.next == Some(Token::OPar) {
-                return parse_func(lex, c_id.as_ptr());
+                return parse_func(lex, id);
             }
 
-            let const_val = match Constant::try_from(c_id.as_ref()) {
+            let const_val = match Constant::try_from(&id as &str) {
                 Ok(c) => c,
                 Err(_) => {
                     return Err(parse_error!(
                         "unknown identifier '{}'",
-                        c_id.to_str().unwrap(),
+                        id,
                     ));
                 }
             };
 
-            let num = node_new(NODE_CONST);
-            (*num).value = Value::Constant(const_val);
+            let value = Value::Constant(const_val);
 
-            Ok(num)
+            Ok(Node::Value(value))
         }
         Token::Number(n) => {
-            let num_0 = node_new(NODE_VAL);
+            let value = Value::Number(n);
 
-            (*num_0).value = Value::Number(n);
-
-            Ok(num_0)
+            Ok(Node::Value(value))
         }
         Token::OPar => parse_parens(lex),
         _ => Err(Error::expect("a number or parentheses", ntok)),
     }
 }
 
-unsafe fn parse_binary(
+fn parse_binary(
     lex: &mut lex,
-    mut lhs: *mut node,
-    mut min_prec: OpPrec,
-) -> Result<*mut node, Error> {
-    let mut cur_op_prec: OpPrec = 0;
+    mut lhs: Node,
+    min_prec: OpPrec,
+) -> Result<Node, Error> {
+    let mut cur_op_prec: OpPrec;
 
     loop {
         let next = match &lex.next {
@@ -911,7 +877,7 @@ unsafe fn parse_binary(
         cur_op_prec = next.prec();
 
         if cur_op_prec >= min_prec && next.arity() == OpArity::Binary {
-            let mut op_tok = lex.next()?;
+            let op_tok = lex.next()?;
 
             let mut rhs = parse_unary(lex)?;
 
@@ -924,7 +890,11 @@ unsafe fn parse_binary(
                 }
             }
 
-            lhs = node_bin_from_token(op_tok, lhs, rhs)
+            lhs = Node::Binary{ 
+                op: op_tok.try_into()?,
+                lhs: lhs.into(),
+                rhs: rhs.into(),
+            };
         } else {
             break;
         }
@@ -933,110 +903,38 @@ unsafe fn parse_binary(
     Ok(lhs)
 }
 
-unsafe fn parse_unary(lex: &mut lex) -> Result<*mut node, Error> {
+fn parse_unary(lex: &mut lex) -> Result<Node, Error> {
     match &lex.next {
         Some(next) if next == &Token::Minus || next == &Token::Plus => {
             let op_top = lex.next()?;
 
             let right_expr = parse_unary(lex)?;
 
-            if op_top == Token::Minus {
-                if (*right_expr).kind as libc::c_uint != NODE_VAL as libc::c_int as libc::c_uint {
-                    let mut neg_expr: *mut node = node_new(NODE_NEG);
-                    (*neg_expr).left = right_expr;
-                    return Ok(neg_expr);
-                } else {
-                    (*right_expr).value = Value::Number(
-                        -f64::try_from((*right_expr).value)
-                            .map_err(|_| parse_error!("cannot negate a non-number"))?,
-                    );
-                }
-            }
+            match op_top {
+                Token::Minus => Ok(
+                    if let Node::Value(Value::Number(num)) = right_expr {                        
+                        let new_val = Value::Number(-num);
 
-            Ok(right_expr)
+                        Node::Value(new_val)
+                    } else {
+                        Node::Unary {
+                            op: UnaryOp::Neg,
+                            expr: right_expr.into(),
+                        }
+                    }
+                ),
+                Token::Plus => Ok(right_expr),
+                _ => unreachable!(),
+            }
         }
         _ => parse_primary(lex),
     }
 }
 
-unsafe fn parse_expr(lex: &mut lex) -> Result<*mut node, Error> {
-    if let Some(Token::Newline) | None = lex.next {
-        return Ok(ptr::null_mut());
-    }
-
-    let mut lhs = parse_unary(lex)?;
-
+fn parse_expr(lex: &mut lex) -> Result<Node, Error> {
+    let lhs = parse_unary(lex)?;
+    
     parse_binary(lex, lhs, -1i8)
-}
-
-unsafe fn node_dump_padded(mut node: *mut node, mut padding: u8, mut arrow: bool) {
-    if node.is_null() {
-        return;
-    }
-    let mut i: u8 = 0 as libc::c_int as u8;
-    while (i as libc::c_int) < padding as libc::c_int {
-        print!(" ");
-        i = i.wrapping_add(1)
-    }
-    if arrow {
-        // Sorry Windows, no fancy UTF-8 for you
-        print!("└─→ ");
-    }
-    match (*node).kind as libc::c_uint {
-        0 | 2 | 8 => {
-            print!("{}", (*node).value);
-        }
-        1 => {
-            print!("/");
-        }
-        3 => {
-            print!("-");
-        }
-        4 => {
-            print!("- (neg)");
-        }
-        5 => {
-            print!("+");
-        }
-        6 => {
-            print!("^");
-        }
-        7 => {
-            print!("*");
-        }
-        _ => {}
-    }
-    print!("\n");
-    node_dump_padded(
-        (*node).left,
-        (padding as libc::c_int + 2 as libc::c_int) as u8,
-        1 as libc::c_int != 0,
-    );
-    node_dump_padded(
-        (*node).right,
-        (padding as libc::c_int + 2 as libc::c_int) as u8,
-        1 as libc::c_int != 0,
-    );
-}
-
-unsafe fn eval_node(mut node: *mut node) -> f64 {
-    if node.is_null() {
-        return f64::NAN;
-    }
-
-    let left: f64 = eval_node((*node).left);
-    let right: f64 = eval_node((*node).right);
-    match (*node).kind as libc::c_uint {
-        0 | 2 | 8 => return (*node).value.eval(Some(left)),
-        1 => return left / right,
-        3 => return left - right,
-        4 => return -left,
-        5 => return left + right,
-        6 => return left.powf(right),
-        7 => return left * right,
-        _ => {}
-    }
-    panic!("Reached end of non-void function without returning");
 }
 
 fn print_help(progname: &str) {
@@ -1090,21 +988,26 @@ fn main() {
         };
 
         loop {
+            if lex.next.is_none() {
+                break;
+            }
+
+            if let Some(Token::Newline) = &lex.next {
+                // Discard the newline
+                lex.try_discard();
+            }
+
             match parse_expr(&mut lex) {
                 Ok(tree) => {
-                    let res: f64 = eval_node(tree);
-                    // eval_node(NULL) (i.e. empty expression) always returns NaN.
-                    // Avoid printing it (it's probably because someone has typed ctrl+d)
-                    if !tree.is_null() {
-                        if print_node {
-                            println!("\nTree:\n");
-                            node_dump_padded(tree, 0u8, false);
-                            println!("");
-                        }
+                    let res: f64 = tree.eval();
 
-                        println!("{}", GPoint(res));
+                    if print_node {
+                        println!("\nTree:\n");
+                        tree.dump();
+                        println!("");
                     }
-                    node_free(tree);
+
+                    println!("{}", GPoint(res));
 
                     match lex.next() {
                         Ok(ntok) => {
