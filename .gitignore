@@ -1,6 +1,6 @@
 build
 *.o
-
+.vscode
 
 # Added by cargo
 
