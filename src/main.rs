@@ -46,16 +46,16 @@ impl fmt::Display for LexError {
 
 #[derive(Clone, Debug)]
 enum Error {
-    LexError { source: LexError },
+    LexFail { source: LexError },
     MalformedUnicode,
-    ParseError(String),
+    ParseFail(String),
     UnknownConstant { name: String },
     UnknownFunction { name: String },
 }
 
 macro_rules! parse_error {
     ($($arg:tt)*) => {{
-        $crate::Error::ParseError(format!($($arg)*))
+        $crate::Error::ParseFail(format!($($arg)*))
     }}
 }
 
@@ -71,20 +71,20 @@ macro_rules! try_noeof {
 
 impl Error {
     pub fn expect(wanted: &str, got: Token) -> Self {
-        Self::ParseError(format!("expecting {}, got '{}'", wanted, got))
+        Self::ParseFail(format!("expecting {}, got '{}'", wanted, got))
     }
 }
 
 impl From<LexError> for Error {
     fn from(source: LexError) -> Self {
-        Self::LexError { source }
+        Self::LexFail { source }
     }
 }
 
 impl error::Error for Error {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
         match self {
-            Error::LexError { source } => Some(source),
+            Error::LexFail { source } => Some(source),
             _ => None,
         }
     }
@@ -95,9 +95,9 @@ impl fmt::Display for Error {
         use Error::*;
 
         match self {
-            LexError { source } => write!(f, "{}", source),
+            LexFail { source } => write!(f, "{}", source),
             MalformedUnicode => write!(f, "malformed unicode detected"),
-            ParseError(s) => write!(f, "parse error: {}", s),
+            ParseFail(s) => write!(f, "parse error: {}", s),
             UnknownConstant { name } => write!(f, "unknown constant: {}", name),
             UnknownFunction { name } => {
                 write!(f, "unknown function '{}'", name)
@@ -292,10 +292,7 @@ impl <'a> BaseLex<'a> {
         let base = Chars::new(Box::new(br) as Box<dyn io::BufRead>)
             .map(|el| el.map(|(_, c)| c))
             .map(|el| el.map_err(LexError::from))
-            .filter(|el| match el {
-                Ok('\t' | '\r' | ' ') => false,
-                _ => true,
-            });
+            .filter(|el| !matches!(el, Ok('\t' | '\r' | ' ')));
 
         let boxed: Box<dyn Iterator<Item = _>> = Box::new(base);
         let chs = boxed.peekable();
@@ -704,7 +701,7 @@ fn parse_primary(lex: &mut Lex) -> Result<Node, Error> {
                 return parse_func(lex, id);
             }
 
-            let const_val = match Constant::try_from(&id as &str) {
+            let const_val = match Constant::try_from(id as &str) {
                 Ok(c) => c,
                 Err(_) => {
                     return Err(parse_error!("unknown identifier '{}'", id,));
@@ -862,7 +859,7 @@ fn main() {
                 if print_node {
                     println!("\nTree:\n");
                     tree.dump();
-                    println!("");
+                    println!();
                 }
 
                 println!("{}", GPoint(res));
