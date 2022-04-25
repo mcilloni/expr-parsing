@@ -1,35 +1,36 @@
-#![allow(
-    mutable_transmutes,
-    non_camel_case_types,
-    non_snake_case,
-    non_upper_case_globals,
-)]
-
-use std::{
-    error,
-    ffi::CStr,
-    fmt, io, mem,
-    process::exit,
-};
+use std::{error, ffi::CStr, fmt, io, iter::Peekable, process::exit};
 
 use gpoint::GPoint;
 
-#[derive(Eq, Debug, PartialEq)]
+#[macro_use]
+mod macros;
+
+mod charsource;
+
+use charsource::{Chars, Error as SourceError};
+
+#[derive(Clone, Debug)]
 enum LexError {
     Eof,
 
-    InvalidUtf8 { cause: std::str::Utf8Error },
+    IoError {
+        cause: io::ErrorKind
+    },
 
-    IoError,
     UnexpectedChar(char),
+}
+
+impl From<SourceError> for LexError {
+    fn from(source: SourceError) -> LexError {        
+        match source {
+            SourceError::IoError { cause } => LexError::IoError { cause },
+        }
+    }
 }
 
 impl error::Error for LexError {
     fn source(&self) -> Option<&(dyn error::Error + 'static)> {
-        match self {
-            LexError::InvalidUtf8 { cause } => Some(cause),
-            _ => None,
-        }
+        None
     }
 }
 
@@ -37,14 +38,13 @@ impl fmt::Display for LexError {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             LexError::Eof => write!(f, "reached end of file"),
-            LexError::InvalidUtf8 { cause } => write!(f, "invalid UTF-8: {}", cause),
-            LexError::IoError => write!(f, "I/O error"),
+            LexError::IoError { cause } => write!(f, "I/O error: {}", cause),
             LexError::UnexpectedChar(c) => write!(f, "unexpected character: {}", c),
         }
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum Error {
     LexError { source: LexError },
     MalformedUnicode,
@@ -57,6 +57,16 @@ macro_rules! parse_error {
     ($($arg:tt)*) => {{
         $crate::Error::ParseError(format!($($arg)*))
     }}
+}
+
+macro_rules! try_noeof {
+    ($expr:expr) => {
+        match $expr {
+            Some(Ok(v)) => v,
+            Some(Err(v)) => return Err(From::from(v)),
+            None => return Err(From::from(LexError::Eof)),
+        }
+    };
 }
 
 impl Error {
@@ -273,6 +283,139 @@ impl Func {
     }
 }
 
+struct BaseLex<'a> {
+    pub chs: Peekable<Box<dyn Iterator<Item = Result<char, LexError>> + 'a>>,
+}
+
+impl <'a> BaseLex<'a> {
+    fn new<'b: 'a> (br: impl io::BufRead + 'b) -> Self {
+        let base = Chars::new(Box::new(br) as Box<dyn io::BufRead>)
+            .map(|el| el.map(|(_, c)| c))
+            .map(|el| el.map_err(LexError::from))
+            .filter(|el| match el {
+                Ok('\t' | '\r' | ' ') => false,
+                _ => true,
+            });
+
+        let boxed: Box<dyn Iterator<Item = _>> = Box::new(base);
+        let chs = boxed.peekable();
+
+        BaseLex {
+            chs,
+        }
+    }
+
+    fn next_id_tok(&mut self) -> Result<Token, LexError> {
+        let mut id_acc = String::new();
+
+        loop {
+            let peek = try_noeof!(self.chs.peek().cloned());
+
+            if !peek.is_alphanumeric() {
+                break;
+            }
+
+            self.chs.next();
+
+            id_acc.push(peek);
+        }
+
+        Ok(Token::Id(id_acc))
+    }
+
+    fn next_num_tok(&mut self) -> Result<Token, LexError> {
+        let mut val = 0u64;
+        let mut dec_div = 1.0f64;
+        let mut dec: bool = false;
+
+        loop {
+            let next = try_noeof!(self.chs.peek().cloned());
+            
+            if next == '.' {
+                if dec {
+                    // Two dots in a numeric token
+                    return Err(LexError::UnexpectedChar('.'));
+                } else {
+                    dec = true; // drop the dot
+                    self.chs.next();
+                }
+            } else if let Some(digit) = next.to_digit(10) {
+                // discard the number we've already
+                self.chs.next();
+
+                val = 10 * val + digit as u64;
+
+                if dec {
+                    dec_div *= 10.0f64;
+                }
+            } else {
+                break;
+            }
+        }
+
+        Ok(Token::Number(val as f64 / dec_div))
+    }
+}
+
+impl Iterator for BaseLex<'_> {
+    type Item = Result<Token, LexError>;
+
+    fn next(&mut self) -> Option<Result<Token, LexError>> {
+        let peek = try_eof!(self.chs.peek().cloned());
+
+        let single_tok = match peek {
+            '/' => Token::Div,
+            '-' => Token::Minus,
+            '+' => Token::Plus,
+            '*' => Token::Times,
+            '\n' => Token::Newline,
+            '(' => Token::OPar,
+            ')' => Token::CPar,
+            '^' => Token::Caret,
+            ch => {
+                return if ch.is_digit(10) || ch == '.' {
+                    Some(self.next_num_tok())
+                } else if ch.is_ascii_alphabetic() {
+                    Some(self.next_id_tok())
+                } else {
+                    Some(Err(LexError::UnexpectedChar(ch)))
+                }
+            },
+        };
+
+        // pop the peeked character
+        self.chs.next();
+
+        Some(Ok(single_tok))
+    }
+}
+
+struct Lex<'a>(Peekable<BaseLex<'a>>);
+
+impl <'a> Lex<'a> {
+    pub fn new<'b: 'a>(br: impl io::BufRead + 'b) -> Self {
+        br.into()
+    }
+
+    pub fn peek(&mut self) -> Option<&Result<Token, LexError>> {
+        self.0.peek()
+    }
+}
+
+impl<'a, 'b: 'a, B: io::BufRead + 'b> From<B> for Lex<'a> {
+    fn from(b: B) -> Self {
+        Self(BaseLex::new(b).peekable())
+    }
+}
+
+impl <'a> Iterator for Lex<'a> {
+    type Item = <BaseLex<'a> as Iterator>::Item;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.0.next()
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 enum Node {
     Binary {
@@ -326,7 +469,9 @@ impl Node {
             Call { func, args } => {
                 writeln!(w, "{}", func)?;
 
-                args.first().unwrap().dump_tree_impl_to(w, padding + 2, true)?;
+                args.first()
+                    .unwrap()
+                    .dump_tree_impl_to(w, padding + 2, true)?;
             }
             Unary { op, expr: arg } => {
                 writeln!(w, "{}", op)?;
@@ -343,14 +488,14 @@ impl Node {
 
     fn eval(&self) -> f64 {
         use Node::*;
-    
+
         match self {
             Binary { op, lhs, rhs } => {
                 let left = lhs.eval();
                 let right = rhs.eval();
-    
+
                 use BinaryOp::*;
-    
+
                 match op {
                     Div => left / right,
                     Minus => left - right,
@@ -358,18 +503,18 @@ impl Node {
                     Plus => left + right,
                     Times => left * right,
                 }
-            },
+            }
             Call { func, args } => {
                 let arg = args.first().expect("no args").eval();
-    
+
                 func.eval(arg)
             }
             Value(val) => val.into(),
             Unary { op, expr } => {
                 let right = expr.eval();
-    
+
                 use UnaryOp::*;
-    
+
                 match op {
                     Neg => -right,
                 }
@@ -522,247 +667,18 @@ impl fmt::Display for Value {
     }
 }
 
-extern "C" {
-    fn __ctype_b_loc() -> *mut *const libc::c_ushort;
-
-    fn _IO_getc(__fp: *mut _IO_FILE) -> libc::c_int;
-
-    static mut stdin: *mut _IO_FILE;
-
-    fn fclose(__stream: *mut FILE) -> libc::c_int;
-
-    fn ferror(__stream: *mut FILE) -> libc::c_int;
-
-    fn ungetc(__c: libc::c_int, __stream: *mut FILE) -> libc::c_int;
-}
-
-type __off_t = libc::c_long;
-type __off64_t = libc::c_long;
-
-#[derive(Copy, Clone)]
-#[repr(C)]
-struct _IO_FILE {
-    pub _flags: libc::c_int,
-    pub _IO_read_ptr: *mut libc::c_char,
-    pub _IO_read_end: *mut libc::c_char,
-    pub _IO_read_base: *mut libc::c_char,
-    pub _IO_write_base: *mut libc::c_char,
-    pub _IO_write_ptr: *mut libc::c_char,
-    pub _IO_write_end: *mut libc::c_char,
-    pub _IO_buf_base: *mut libc::c_char,
-    pub _IO_buf_end: *mut libc::c_char,
-    pub _IO_save_base: *mut libc::c_char,
-    pub _IO_backup_base: *mut libc::c_char,
-    pub _IO_save_end: *mut libc::c_char,
-    pub _markers: *mut _IO_marker,
-    pub _chain: *mut _IO_FILE,
-    pub _fileno: libc::c_int,
-    pub _flags2: libc::c_int,
-    pub _old_offset: __off_t,
-    pub _cur_column: libc::c_ushort,
-    pub _vtable_offset: libc::c_schar,
-    pub _shortbuf: [libc::c_char; 1],
-    pub _lock: *mut libc::c_void,
-    pub _offset: __off64_t,
-    pub __pad1: *mut libc::c_void,
-    pub __pad2: *mut libc::c_void,
-    pub __pad3: *mut libc::c_void,
-    pub __pad4: *mut libc::c_void,
-    pub __pad5: usize,
-    pub _mode: libc::c_int,
-    pub _unused2: [libc::c_char; 20],
-}
-type _IO_lock_t = ();
-#[derive(Copy, Clone)]
-#[repr(C)]
-struct _IO_marker {
-    pub _next: *mut _IO_marker,
-    pub _sbuf: *mut _IO_FILE,
-    pub _pos: libc::c_int,
-}
-type FILE = _IO_FILE;
-
-#[derive(Clone)]
-#[repr(C)]
-struct lex {
-    pub f: *mut FILE,
-    pub next: Option<Token>,
-}
-
-impl lex {
-    fn from_stdio(f: *mut FILE) -> Result<Self, LexError> {
-        let mut ret = Self { f: f, next: None };
-
-        ret.f = f;
-        ret.next = unsafe {
-            Some(ret.next_tok()?)
-        };
-
-        Ok(ret)
-    }
-
-    unsafe fn next_id_tok(&mut self) -> Result<Token, LexError> {
-        let mut id_acc = vec![];
-
-        loop {
-            let peek = peekc(self.f);
-            if peek == -1 && ferror(self.f) != 0 {
-                return Err(LexError::IoError);
-            }
-
-            if !char::from_u32_unchecked(peek as u32).is_ascii_alphanumeric() {
-                break;
-            }
-
-            id_acc.push(nextc(self.f) as u8);
-        }
-
-        let id_str = String::from_utf8(id_acc).map_err(|e| LexError::InvalidUtf8 {
-            cause: e.utf8_error(),
-        })?;
-
-        Ok(Token::Id(id_str))
-    }
-
-    unsafe fn next_num_tok(&mut self) -> Result<Token, LexError> {
-        let mut val = 0u64;
-        let mut dec_div = 1.0f64;
-        let mut dec: bool = false;
-
-        loop {
-            let next = peekc(self.f);
-            if next == -1 && ferror(self.f) != 0 {
-                return Err(LexError::IoError);
-            }
-            if next as libc::c_int == '.' as i32 {
-                if dec {
-                    // Two dots in a numeric token
-                    return Err(LexError::UnexpectedChar('.'));
-                } else {
-                    dec = 1 as libc::c_int != 0; // drop the dot
-                    _IO_getc(self.f); 
-                }
-            } else {
-                if char::from_u32_unchecked(next as u32).is_ascii_digit() {
-                    _IO_getc(self.f); // discard the number we've already
-                    
-                    val = (10 as libc::c_int as libc::c_ulong)
-                    .wrapping_mul(val)
-                    .wrapping_add((next as libc::c_int - '0' as i32) as libc::c_ulong);
-                    if dec {
-                        dec_div *= 10.0f64;
-                    }
-                } else {
-                    break;
-                }
-            }
-        }
-
-        Ok(Token::Number(val as f64 / dec_div))
-    }
-
-    unsafe fn next_tok(&mut self) -> Result<Token, LexError> {
-        let first = nextc(self.f) as libc::c_char;
-        if first == -1 {
-            if ferror(self.f) != 0 {
-                return Err(LexError::IoError);
-            }
-
-            return Err(LexError::Eof);
-        }
-
-        Ok(match first as u8 as char {
-            '/' => Token::Div,
-            '-' => Token::Minus,
-            '+' => Token::Plus,
-            '*' => Token::Times,
-            '\n' => Token::Newline,
-            '(' => Token::OPar,
-            ')' => Token::CPar,
-            '^' => Token::Caret,
-            ch => {
-                ungetc(first as libc::c_int, self.f);
-
-                if ch.is_ascii_digit() || ch == '.' {
-                    self.next_num_tok()?
-                } else if ch.is_ascii_alphabetic() {
-                    self.next_id_tok()?
-                } else {
-                    return Err(LexError::UnexpectedChar(ch));
-                }
-            }
-        })
-    }
-
-    pub fn next(&mut self) -> Result<Token, LexError> {
-        if self.next.is_none() {
-            return Err(LexError::Eof);
-        }
-
-        unsafe {
-            let some_succ = match self.next_tok() {
-                Ok(tok) => Some(tok),
-                Err(LexError::Eof) => None,
-                Err(e) => return Err(e),
-            };
-
-            mem::replace(&mut self.next, some_succ).ok_or(LexError::Eof)
-        }
-    }
-
-    pub fn try_discard(&mut self) -> bool {
-        self.next().is_ok()
-    }
-}
-
-impl Drop for lex {
-    fn drop(&mut self) {
-        unsafe {
-            if self.f != stdin {
-                fclose(self.f);
-            }
-        }
-    }
-}
-
-unsafe fn nextc(f: *mut FILE) -> libc::c_int {
-    loop {
-        let ch = _IO_getc(f) as libc::c_char;
-        
-        if ch < 0 {
-            return ch as libc::c_int;
-        }
-
-        match ch as u8 as char {
-            '\t' | '\r' | ' ' => {},
-            ch => return ch as libc::c_int, 
-        }
-    }
-}
-
-unsafe fn peekc(f: *mut FILE) -> libc::c_int {
-    let ret = _IO_getc(f);
-
-    if ret > 0 as libc::c_int {
-        ungetc(ret, f);
-    }
-    
-    return ret;
-}
-
-fn parse_parens(lex: &mut lex) -> Result<Node, Error> {
+fn parse_parens(lex: &mut Lex) -> Result<Node, Error> {
     let par_expr = parse_expr(lex)?;
 
-    let cpar_tok = lex.next()?;
-
-    if cpar_tok == Token::CPar {
-        Ok(par_expr)
-    } else {
-        Err(Error::expect(")", cpar_tok))
+    match lex.next() {
+        Some(Ok(Token::CPar)) => Ok(par_expr),
+        Some(Ok(tok)) => Err(Error::expect(")", tok)),
+        Some(Err(e)) => Err(e.into()),
+        None => Err(parse_error!("unexpected EOF, expecting ')'")),
     }
 }
 
-fn parse_func(lex: &mut lex, id: &str) -> Result<Node, Error> {
+fn parse_func(lex: &mut Lex, id: &str) -> Result<Node, Error> {
     let f_id = Func::try_from(id)?;
 
     // We know for sure lex->next is a parenthesis, therefore
@@ -776,28 +692,22 @@ fn parse_func(lex: &mut lex, id: &str) -> Result<Node, Error> {
     })
 }
 
-fn parse_primary(lex: &mut lex) -> Result<Node, Error> {
-    let ntok = lex.next().map_err(|lerr| {
-        if lerr == LexError::Eof {
-            parse_error!("unexpected EOF")
-        } else {
-            lerr.into()
-        }
-    })?;
+fn parse_primary(lex: &mut Lex) -> Result<Node, Error> {
+    let ntok = match lex.next().transpose()? {
+        Some(ntok) => ntok,
+        None => return Err(parse_error!("unexpected EOF")),
+    };
 
     match ntok {
         Token::Id(ref id) => {
-            if lex.next == Some(Token::OPar) {
+            if let Some(Ok(Token::OPar)) = lex.peek() {
                 return parse_func(lex, id);
             }
 
             let const_val = match Constant::try_from(&id as &str) {
                 Ok(c) => c,
                 Err(_) => {
-                    return Err(parse_error!(
-                        "unknown identifier '{}'",
-                        id,
-                    ));
+                    return Err(parse_error!("unknown identifier '{}'", id,));
                 }
             };
 
@@ -815,27 +725,24 @@ fn parse_primary(lex: &mut lex) -> Result<Node, Error> {
     }
 }
 
-fn parse_binary(
-    lex: &mut lex,
-    mut lhs: Node,
-    min_prec: OpPrec,
-) -> Result<Node, Error> {
+fn parse_binary(lex: &mut Lex, mut lhs: Node, min_prec: OpPrec) -> Result<Node, Error> {
     let mut cur_op_prec: OpPrec;
 
     loop {
-        let next = match &lex.next {
-            Some(tok) => tok,
+        let next = match lex.peek() {
+            Some(Ok(tok)) => tok,
+            Some(Err(err)) => return Err(err.clone().into()),
             None => break,
         };
 
         cur_op_prec = next.prec();
 
         if cur_op_prec >= min_prec && next.arity() == OpArity::Binary {
-            let op_tok = lex.next()?;
+            let op_tok = try_noeof!(lex.next());
 
             let mut rhs = parse_unary(lex)?;
 
-            if let Some(next) = &lex.next {
+            if let Some(next) = lex.peek().cloned().transpose()? {
                 let next_op_prec = next.prec();
                 let next_assoc_right = next.assoc() == OpAssoc::Right;
 
@@ -844,7 +751,7 @@ fn parse_binary(
                 }
             }
 
-            lhs = Node::Binary{ 
+            lhs = Node::Binary {
                 op: op_tok.try_into()?,
                 lhs: lhs.into(),
                 rhs: rhs.into(),
@@ -857,26 +764,26 @@ fn parse_binary(
     Ok(lhs)
 }
 
-fn parse_unary(lex: &mut lex) -> Result<Node, Error> {
-    match &lex.next {
-        Some(next) if next == &Token::Minus || next == &Token::Plus => {
-            let op_top = lex.next()?;
+fn parse_unary(lex: &mut Lex) -> Result<Node, Error> {
+    let peek = lex.peek().cloned().transpose()?;
+
+    match peek {
+        Some(next) if next == Token::Minus || next == Token::Plus => {
+            let op_top = try_noeof!(lex.next());
 
             let right_expr = parse_unary(lex)?;
 
             match op_top {
-                Token::Minus => Ok(
-                    if let Node::Value(Value::Number(num)) = right_expr {                        
-                        let new_val = Value::Number(-num);
+                Token::Minus => Ok(if let Node::Value(Value::Number(num)) = right_expr {
+                    let new_val = Value::Number(-num);
 
-                        Node::Value(new_val)
-                    } else {
-                        Node::Unary {
-                            op: UnaryOp::Neg,
-                            expr: right_expr.into(),
-                        }
+                    Node::Value(new_val)
+                } else {
+                    Node::Unary {
+                        op: UnaryOp::Neg,
+                        expr: right_expr.into(),
                     }
-                ),
+                }),
                 Token::Plus => Ok(right_expr),
                 _ => unreachable!(),
             }
@@ -885,9 +792,9 @@ fn parse_unary(lex: &mut lex) -> Result<Node, Error> {
     }
 }
 
-fn parse_expr(lex: &mut lex) -> Result<Node, Error> {
+fn parse_expr(lex: &mut Lex) -> Result<Node, Error> {
     let lhs = parse_unary(lex)?;
-    
+
     parse_binary(lex, lhs, -1i8)
 }
 
@@ -931,71 +838,67 @@ fn main() {
         exit(status);
     }
 
-    unsafe {
-        let mut lex = match lex::from_stdio(stdin) {
-            Ok(lex) => lex,
-            Err(lerr) => {
-                eprintln!("error: {}", lerr);
+    let stdin = io::stdin();
+    let stdin_guard = stdin.lock();
 
-                exit(1i32);
-            }
+    let mut lex = Lex::new(stdin_guard);
+
+    loop {
+        let discard = match lex.peek() {
+            Some(Ok(Token::Newline)) => true,
+            None => break,
+            _ => false,
         };
 
-        loop {
-            if lex.next.is_none() {
-                break;
-            }
+        if discard {
+            // Discard the newline
+            lex.next();
+        }
 
-            if let Some(Token::Newline) = &lex.next {
-                // Discard the newline
-                lex.try_discard();
-            }
+        match parse_expr(&mut lex) {
+            Ok(tree) => {
+                let res: f64 = tree.eval();
 
-            match parse_expr(&mut lex) {
-                Ok(tree) => {
-                    let res: f64 = tree.eval();
+                if print_node {
+                    println!("\nTree:\n");
+                    tree.dump();
+                    println!("");
+                }
 
-                    if print_node {
-                        println!("\nTree:\n");
-                        tree.dump();
-                        println!("");
-                    }
+                println!("{}", GPoint(res));
 
-                    println!("{}", GPoint(res));
-
-                    match lex.next() {
-                        Ok(ntok) => {
-                            if ntok != Token::Newline {
-                                eprintln!(
-                                    "error: stray '{}' left in stream after expression",
-                                    ntok,
-                                );
-
-                                status = 1i32;
-                                break;
-                            } else {
-                                status = 0 as libc::c_int
-                            }
-                        }
-
-                        Err(LexError::Eof) => {
-                            break;
-                        }
-
-                        Err(lerr) => {
-                            eprintln!("error: {}", lerr);
+                match lex.next() {
+                    Some(Ok(ntok)) => {
+                        if ntok != Token::Newline {
+                            eprintln!(
+                                "error: stray '{}' left in stream after expression",
+                                ntok,
+                            );
 
                             status = 1i32;
                             break;
+                        } else {
+                            status = 0i32; 
                         }
                     }
-                }
-                Err(err) => {
-                    eprintln!("error: {}", err);
-                    status = 1i32;
 
-                    break;
+                    Some(Err(LexError::Eof)) | None => {
+                        break;
+                    }
+
+                    Some(Err(lerr)) => {
+                        eprintln!("error: {}", lerr);
+
+                        status = 1i32;
+                        break;
+                    }
                 }
+            }
+            Err(err) => {
+                eprintln!("error: {}", err);
+                status = 1i32;
+
+                break;
             }
         }
     }
